@@ -102,6 +102,7 @@ var character_data = {
 @onready var settings_menu = $SettingsMenu
 @onready var friends_menu = $FriendsMenu
 @onready var file_dialog = $FileDialog
+@onready var status_label = $StatusLabel
 
 func _ready():
     randomize()
@@ -112,10 +113,12 @@ func _ready():
     _connect_signals()
     load_servers()
     _update_anti_cheat_hash()
+    _validate_game_files()
 
 func _setup_directories():
     DirAccess.make_dir_recursive_absolute("user://screenshots")
     DirAccess.make_dir_recursive_absolute("user://config")
+    DirAccess.make_dir_recursive_absolute("user://avatars")
 
 func _load_player_data():
     if FileAccess.file_exists(SAVE_PATH):
@@ -134,14 +137,17 @@ func _load_player_data():
 func _save_player_data():
     _update_anti_cheat_hash()
     var file = FileAccess.open_encrypted_with_pass(SAVE_PATH, FileAccess.WRITE, _get_encryption_key())
-    file.store_var(player_data)
-    file.close()
+    if file:
+        file.store_var(player_data)
+        file.close()
+    else:
+        push_error("Failed to save player data")
 
 func _get_encryption_key() -> String:
     return OS.get_unique_id() + "secure_salt_" + str(Engine.get_frames_drawn())
 
 func _verify_data_integrity(data) -> bool:
-    if not data.has("anti_cheat_hash"):
+    if not data or not data.has("anti_cheat_hash"):
         return false
     var saved_hash = data["anti_cheat_hash"]
     data.erase("anti_cheat_hash")
@@ -159,7 +165,17 @@ func _handle_corrupted_data():
 
 func _migrate_legacy_data():
     # Для будущих обновлений
-    pass
+    if not player_data.has("player_id"):
+        player_data["player_id"] = ""
+    if not player_data["inventory"].has("equipped"):
+        player_data["inventory"]["equipped"] = {
+            "primary": "rifle",
+            "secondary": "pistol",
+            "melee": "knife",
+            "explosive": null,
+            "character": "default",
+            "skins": {}
+        }
 
 func _generate_player_id():
     if player_data["player_id"] == "":
@@ -181,6 +197,12 @@ func _setup_ui():
     $ServerMenu/RefreshButton.pressed.connect(load_servers)
     $ServerMenu/BackButton.pressed.connect(_switch_to_main_menu)
     
+    # Populate map and mode options
+    for map in available_maps:
+        $ServerMenu/MapOption.add_item(map)
+    for mode in available_modes:
+        $ServerMenu/ModeOption.add_item(mode)
+    
     # Inventory Menu
     $InventoryMenu/BackButton.pressed.connect(_switch_to_main_menu)
     $InventoryMenu/AvatarButton.pressed.connect(_open_avatar_selector)
@@ -197,12 +219,22 @@ func _setup_ui():
     $SettingsMenu/VolumeSlider.value_changed.connect(_update_volume)
     $SettingsMenu/BackButton.pressed.connect(_switch_to_main_menu)
     
+    # Populate graphics options
+    $SettingsMenu/GraphicsOption.add_item("Low")
+    $SettingsMenu/GraphicsOption.add_item("Medium")
+    $SettingsMenu/GraphicsOption.add_item("High")
+    $SettingsMenu/GraphicsOption.selected = 1  # Default to medium
+    
     # Friends Menu
     $FriendsMenu/AddFriendButton.pressed.connect(_add_friend)
     $FriendsMenu/BackButton.pressed.connect(_switch_to_main_menu)
     
     # File Dialog
     file_dialog.file_selected.connect(_on_avatar_selected)
+    file_dialog.filters = ["*.png ; PNG Images"]
+    
+    # Status Label
+    $StatusLabel/Timer.timeout.connect(_on_status_timer_timeout)
     
     _update_ui()
 
@@ -210,7 +242,10 @@ func _update_ui():
     # Main Menu
     $MainMenu/PlayerNameLabel.text = player_data["name"]
     $MainMenu/BalanceLabel.text = "$%d" % player_data["balance"]
-    $MainMenu/AvatarTexture.texture = load(player_data["avatar"])
+    if ResourceLoader.exists(player_data["avatar"]):
+        $MainMenu/AvatarTexture.texture = load(player_data["avatar"])
+    else:
+        $MainMenu/AvatarTexture.texture = load(DEFAULT_AVATAR)
     
     # Cases Menu
     $CasesMenu/BasicCasePrice.text = "$%d" % CASE_PRICES["basic"]
@@ -220,6 +255,14 @@ func _update_ui():
     # Settings
     $SettingsMenu/SensitivitySlider.value = player_data["settings"]["sensitivity"]
     $SettingsMenu/VolumeSlider.value = player_data["settings"]["volume"]
+    
+    match player_data["settings"]["graphics"]:
+        "low":
+            $SettingsMenu/GraphicsOption.selected = 0
+        "medium":
+            $SettingsMenu/GraphicsOption.selected = 1
+        "high":
+            $SettingsMenu/GraphicsOption.selected = 2
     
     _update_vip_status()
 
@@ -278,9 +321,10 @@ func _populate_inventory():
     for weapon in player_data["inventory"]["skins"]:
         for skin in player_data["inventory"]["skins"][weapon]:
             var texture_btn = TextureButton.new()
-            texture_btn.texture_normal = skin_data[weapon][skin]
-            texture_btn.pressed.connect(_equip_skin.bind(weapon, skin))
-            $InventoryMenu/SkinsGrid.add_child(texture_btn)
+            if skin_data.has(weapon) and skin_data[weapon].has(skin):
+                texture_btn.texture_normal = skin_data[weapon][skin]
+                texture_btn.pressed.connect(_equip_skin.bind(weapon, skin))
+                $InventoryMenu/SkinsGrid.add_child(texture_btn)
     
     # Characters
     for character in player_data["inventory"]["characters"]:
@@ -303,6 +347,10 @@ func _clear_inventory_ui():
         child.queue_free()
 
 func _equip_weapon(weapon_name: String):
+    if not weapon_data.has(weapon_name):
+        show_status("Unknown weapon: %s" % weapon_name, Color.RED)
+        return
+    
     var weapon_type = weapon_data[weapon_name]["type"]
     player_data["inventory"]["equipped"][weapon_type] = weapon_name
     _save_player_data()
@@ -310,12 +358,23 @@ func _equip_weapon(weapon_name: String):
     inventory_updated.emit()
 
 func _equip_skin(weapon: String, skin: String):
+    if not player_data["inventory"]["skins"].has(weapon) or not skin in player_data["inventory"]["skins"][weapon]:
+        show_status("Skin not owned", Color.RED)
+        return
+    
+    if not player_data["inventory"]["equipped"].has("skins"):
+        player_data["inventory"]["equipped"]["skins"] = {}
+    
     player_data["inventory"]["equipped"]["skins"][weapon] = skin
     _save_player_data()
     show_status("Скин применен: %s (%s)" % [weapon, skin], Color.GREEN)
     inventory_updated.emit()
 
 func _equip_character(character: String):
+    if not character in player_data["inventory"]["characters"]:
+        show_status("Character not owned", Color.RED)
+        return
+    
     player_data["inventory"]["equipped"]["character"] = character
     _save_player_data()
     show_status("Персонаж выбран: %s" % character, Color.GREEN)
@@ -331,19 +390,26 @@ func _on_avatar_selected(path: String):
         if img:
             var texture = ImageTexture.create_from_image(img)
             var save_path = "user://avatars/%s.png" % player_data["player_id"]
-            texture.get_image().save_png(save_path)
-            
-            player_data["avatar"] = save_path
-            _save_player_data()
-            $MainMenu/AvatarTexture.texture = texture
-            $InventoryMenu/AvatarTexture.texture = texture
-            avatar_changed.emit()
-            show_status("Аватар обновлен!", Color.GREEN)
+            if img.save_png(save_path) == OK:
+                player_data["avatar"] = save_path
+                _save_player_data()
+                $MainMenu/AvatarTexture.texture = texture
+                $InventoryMenu/AvatarTexture.texture = texture
+                avatar_changed.emit()
+                show_status("Аватар обновлен!", Color.GREEN)
+            else:
+                show_status("Не удалось сохранить аватар", Color.RED)
+        else:
+            show_status("Не удалось загрузить изображение", Color.RED)
     else:
-        show_status("Не удалось загрузить изображение", Color.RED)
+        show_status("Файл не найден", Color.RED)
 
 # Case System
 func _open_case(case_type: String):
+    if not CASE_PRICES.has(case_type):
+        show_status("Unknown case type", Color.RED)
+        return
+    
     if player_data["balance"] < CASE_PRICES[case_type]:
         show_status("Недостаточно средств!", Color.RED)
         return
@@ -365,25 +431,31 @@ func _get_case_reward(case_type: String) -> Dictionary:
         "basic":
             rewards = [
                 {"type": "currency", "amount": 200, "weight": 40},
-                {"type": "skin", "weapon": "pistol", "skin": "gold", "weight": 10}
+                {"type": "skin", "weapon": "pistol", "skin": "gold", "weight": 10},
+                {"type": "currency", "amount": 100, "weight": 50}
             ]
         "premium":
             rewards = [
                 {"type": "character", "name": "ninja", "weight": 20},
-                {"type": "vip", "days": 7, "weight": 5}
+                {"type": "vip", "days": 7, "weight": 5},
+                {"type": "skin", "weapon": "rifle", "skin": "camo", "weight": 15},
+                {"type": "currency", "amount": 500, "weight": 60}
             ]
         "weapon":
             rewards = [
                 {"type": "weapon", "name": "shotgun", "weight": 15},
-                {"type": "currency", "amount": 500, "weight": 30}
+                {"type": "currency", "amount": 500, "weight": 30},
+                {"type": "skin", "weapon": "pistol", "skin": "gold", "weight": 10},
+                {"type": "vip", "days": 1, "weight": 5},
+                {"type": "currency", "amount": 1000, "weight": 40}
             ]
     
-    var total_weight = rewards.reduce(func(acc, r): return acc + r["weight"], 0)
+    var total_weight = rewards.reduce(func(acc, r): return acc + r.get("weight", 0), 0)
     var roll = randi() % total_weight
     var cumulative = 0
     
     for reward in rewards:
-        cumulative += reward["weight"]
+        cumulative += reward.get("weight", 0)
         if roll < cumulative:
             return reward.duplicate()
     
@@ -393,20 +465,25 @@ func _process_reward(reward: Dictionary):
     match reward["type"]:
         "currency":
             player_data["balance"] += reward["amount"]
+            balance_updated.emit(player_data["balance"])
         "skin":
             if not player_data["inventory"]["skins"].has(reward["weapon"]):
                 player_data["inventory"]["skins"][reward["weapon"]] = []
             if not reward["skin"] in player_data["inventory"]["skins"][reward["weapon"]]:
                 player_data["inventory"]["skins"][reward["weapon"]].append(reward["skin"])
+                inventory_updated.emit()
         "character":
             if not reward["name"] in player_data["inventory"]["characters"]:
                 player_data["inventory"]["characters"].append(reward["name"])
+                inventory_updated.emit()
         "vip":
             player_data["is_vip"] = true
             player_data["vip_days"] += reward["days"]
+            vip_purchased.emit(player_data["player_id"])
         "weapon":
             if not reward["name"] in player_data["inventory"]["weapons"]:
                 player_data["inventory"]["weapons"].append(reward["name"])
+                inventory_updated.emit()
 
 func _format_reward(reward: Dictionary) -> String:
     match reward["type"]:
@@ -426,16 +503,20 @@ func _format_reward(reward: Dictionary) -> String:
 # Settings System
 func _update_sensitivity(value: float):
     player_data["settings"]["sensitivity"] = value
+    _save_player_data()
     settings_applied.emit()
 
 func _update_graphics(index: int):
     var qualities = ["low", "medium", "high"]
-    player_data["settings"]["graphics"] = qualities[index]
-    _apply_graphics_settings()
-    settings_applied.emit()
+    if index < qualities.size():
+        player_data["settings"]["graphics"] = qualities[index]
+        _save_player_data()
+        _apply_graphics_settings()
+        settings_applied.emit()
 
 func _update_volume(value: float):
     player_data["settings"]["volume"] = value
+    _save_player_data()
     AudioServer.set_bus_volume_db(AudioServer.get_bus_index("Master"), linear_to_db(value))
     settings_applied.emit()
 
@@ -443,10 +524,13 @@ func _apply_graphics_settings():
     match player_data["settings"]["graphics"]:
         "low":
             ProjectSettings.set_setting("rendering/quality/intended_usage/framebuffer_allocation", 0)
+            get_tree().root.set_msaa(Window.MSAA_DISABLED)
         "medium":
             ProjectSettings.set_setting("rendering/quality/intended_usage/framebuffer_allocation", 1)
+            get_tree().root.set_msaa(Window.MSAA_4X)
         "high":
             ProjectSettings.set_setting("rendering/quality/intended_usage/framebuffer_allocation", 2)
+            get_tree().root.set_msaa(Window.MSAA_8X)
 
 # Friends System
 func _update_friends_list():
@@ -488,6 +572,7 @@ func _add_friend():
     _update_friends_list()
     friend_added.emit(friend_id)
     show_status("Друг добавлен: %s" % friend_id, Color.GREEN)
+    $FriendsMenu/FriendIDEdit.text = ""
 
 func _remove_friend(friend_id: String):
     player_data["friends"].erase(friend_id)
@@ -497,7 +582,6 @@ func _remove_friend(friend_id: String):
     show_status("Друг удален: %s" % friend_id, Color.GREEN)
 
 func _join_friend_server(friend_id: String):
-    # В реальной игре здесь должен быть запрос к серверу для получения информации
     show_status("Запрашиваем информацию о сервере друга...", Color.WHITE)
     
     # Эмуляция ответа сервера
@@ -508,7 +592,9 @@ func _join_friend_server(friend_id: String):
         "port": DEFAULT_PORT,
         "name": "%s's Server" % friend_id,
         "map": "Dust",
-        "mode": "Deathmatch"
+        "mode": "Deathmatch",
+        "players": 1,
+        "max_players": MAX_PLAYERS
     }
     
     _connect_to_server(server_info)
@@ -531,8 +617,8 @@ func _refresh_server_list():
         var btn = Button.new()
         btn.text = "%s - %s:%d (%d/%d)" % [
             server.get("name", "Unnamed"),
-            server["ip"],
-            server["port"],
+            server.get("ip", "127.0.0.1"),
+            server.get("port", DEFAULT_PORT),
             server.get("players", 0),
             server.get("max_players", MAX_PLAYERS)
         ]
@@ -544,18 +630,22 @@ func _create_server():
     if server_name == "":
         server_name = "%s's Server" % player_data["name"]
     
+    var selected_map = available_maps[$ServerMenu/MapOption.selected]
+    var selected_mode = available_modes[$ServerMenu/ModeOption.selected]
+    
     var server_config = {
         "name": server_name,
         "ip": _get_local_ip(),
         "port": DEFAULT_PORT,
-        "map": $ServerMenu/MapOption.get_item_text($ServerMenu/MapOption.selected),
-        "mode": $ServerMenu/ModeOption.get_item_text($ServerMenu/ModeOption.selected),
+        "map": selected_map,
+        "mode": selected_mode,
         "max_players": $ServerMenu/MaxPlayersSlider.value,
         "password": $ServerMenu/PasswordEdit.text,
         "rules": {
             "friendly_fire": $ServerMenu/FriendlyFireCheck.button_pressed,
             "weapon_restrictions": []
-        }
+        },
+        "players": 1
     }
     
     current_server_info = server_config
@@ -578,7 +668,7 @@ func _get_local_ip() -> String:
 
 func _start_server():
     var peer = ENetMultiplayerPeer.new()
-    var err = peer.create_server(current_server_info[["port"], max_players)
+    var err = peer.create_server(current_server_info["port"], current_server_info["max_players"])
     if err == OK:
         multiplayer.multiplayer_peer = peer
         multiplayer.peer_connected.connect(_on_player_connected)
@@ -614,6 +704,7 @@ func _connect_to_server(server_info: Dictionary):
 
 func _on_connection_failed():
     show_status("Не удалось подключиться к серверу", Color.RED)
+    multiplayer.multiplayer_peer = null
 
 func _on_connected_to_server():
     show_status("Успешное подключение!", Color.GREEN)
@@ -621,23 +712,26 @@ func _on_connected_to_server():
 
 func _start_game():
     var game_scene = load(GAME_SCENE_PATH).instantiate()
-    game_scene.server_info = current_server_info
-    game_scene.player_data = player_data
-    game_scene.is_server = is_server
-    
-    get_tree().root.add_child(game_scene)
-    get_tree().current_scene.queue_free()
-    get_tree().current_scene = game_scene
+    if game_scene:
+        game_scene.server_info = current_server_info
+        game_scene.player_data = player_data
+        game_scene.is_server = is_server
+        
+        get_tree().root.add_child(game_scene)
+        get_tree().current_scene.queue_free()
+        get_tree().current_scene = game_scene
+    else:
+        show_status("Failed to load game scene", Color.RED)
 
 # Utility Functions
 func show_status(message: String, color: Color = Color.WHITE):
-    $StatusLabel.text = message
-    $StatusLabel.modulate = color
-    $StatusLabel.visible = true
-    $StatusLabel/Timer.start()
+    status_label.text = message
+    status_label.modulate = color
+    status_label.visible = true
+    $StatusLabel/Timer.start(3.0)
 
 func _on_status_timer_timeout():
-    $StatusLabel.visible = false
+    status_label.visible = false
 
 func _notification(what):
     if what == NOTIFICATION_WM_CLOSE_REQUEST:
@@ -674,3 +768,31 @@ func _check_for_cheats():
             player_data["inventory"]["weapons"] = ["pistol", "rifle"]
             _save_player_data()
             break
+
+# VIP System
+func purchase_vip():
+    if player_data["is_vip"]:
+        show_status("Вы уже имеете VIP статус", Color.YELLOW)
+        return
+    
+    if player_data["balance"] < VIP_PRICE:
+        show_status("Недостаточно средств для покупки VIP", Color.RED)
+        return
+    
+    player_data["balance"] -= VIP_PRICE
+    player_data["is_vip"] = true
+    player_data["vip_days"] += VIP_DAYS
+    _save_player_data()
+    _update_ui()
+    vip_purchased.emit(player_data["player_id"])
+    show_status("VIP статус активирован на %d дней!" % VIP_DAYS, Color.GOLD)
+
+func update_vip_days():
+    if player_data["is_vip"]:
+        player_data["vip_days"] -= 1
+        if player_data["vip_days"] <= 0:
+            player_data["is_vip"] = false
+            player_data["vip_days"] = 0
+            show_status("Ваш VIP статус истек", Color.YELLOW)
+        _save_player_data()
+        _update_ui()
